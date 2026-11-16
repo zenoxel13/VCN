@@ -29,6 +29,8 @@ LGB_PARAMS = {"objective": "multiclass", "num_class": 3, "learning_rate": 0.03, 
               "deterministic": True, "force_col_wise": True, "verbose": -1}
 MAX_ROUNDS, EARLY_STOPPING = 2000, 100
 ODDS_COLS = ["f_odds_p_home", "f_odds_p_draw", "f_odds_p_away"]
+OWN, LINEUP = "наші ознаки (з історією ринку)", "ознаки складів (модель учасника)"
+PREDICTION_KEYS = {"own": OWN, "lineup": LINEUP, "combined": COMBINED}  # префікси колонок у файлі прогнозів
 
 
 def load_model2():
@@ -134,6 +136,15 @@ def write_report(table: pd.DataFrame, sizes: tuple[int, int, int], gain: pd.Seri
     table.to_csv(config.REPORTS / "combined_metrics.csv", index=False)
 
 
+def save_test_predictions(test: pd.DataFrame, test_preds: dict) -> None:
+    """Зберігає прогнози трьох моделей для кожного матчу тесту — їх показує застосунок."""
+    out = test[["date", "competition", "home", "away", "home_goals", "away_goals", "target"]].copy()
+    for key, name in PREDICTION_KEYS.items():
+        for k, cls in enumerate(config.CLASSES):
+            out[f"{key}_{cls}"] = np.round(test_preds[name][:, k], 4)
+    out.to_csv(config.REPORTS / "combined_test_preds.csv", index=False)
+
+
 def main() -> None:
     """Будує об'єднану таблицю, навчає варіанти на однакових матчах і пише звіт."""
     started = time.time()
@@ -145,15 +156,16 @@ def main() -> None:
           f"ознак складів {len(lineup_cols)} ({time.time() - started:.0f} с)")
 
     odds_all = [c for c in df.columns if c.startswith("f_odds_")]
-    feature_sets = {"наші ознаки (з історією ринку)": own_cols,
-                    "ознаки складів (модель учасника)": lineup_cols,
+    feature_sets = {OWN: own_cols,
+                    LINEUP: lineup_cols,
                     COMBINED: own_cols + lineup_cols,
                     "наші + коефіцієнти БК": own_cols + odds_all,
                     "об'єднана + коефіцієнти БК": own_cols + lineup_cols + odds_all}
     y_test, y_val = test["y"].to_numpy(), val["y"].to_numpy()
-    rows, boosters = [], {}
+    rows, boosters, test_preds = [], {}, {}
     for name, cols in feature_sets.items():
         boosters[name], p_test, p_val = fit_predict(train, val, test, cols)
+        test_preds[name] = p_test
         rows.append({"модель": name, "ознак": len(cols), **scores(y_test, p_test), "val_log_loss": scores(y_val, p_val)["log_loss"]})
 
     prior = np.bincount(train["y"], minlength=3) / len(train)
@@ -168,6 +180,7 @@ def main() -> None:
     joblib.dump({"booster": best, "features": feature_sets[COMBINED], "best_iteration": best.best_iteration},
                 config.MODELS / "clubs_combined.joblib")
     write_report(table, (len(train), len(val), len(test)), gain)
+    save_test_predictions(test, test_preds)
     print(table.round(4).to_string(index=False))
     print(f"[combined] готово за {time.time() - started:.0f} с")
 
