@@ -21,3 +21,6 @@ Football Match Winner Prediction
 Визначити основні показники для прогнозування.
 
 Перевірити точність прогнозів на тестових даних.
+
+Лінк гітхаба з датасетом для моделі 1: 
+https://github.com/dcaribou/transfermarkt-datasets
