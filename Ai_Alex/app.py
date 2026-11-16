@@ -294,15 +294,31 @@ def compare_table(model: dict[str, float], market: dict[str, float]) -> pd.DataF
 
 # ---------------------------------------------------------------- ввід
 
+ALL_LEAGUES = "(усі ліги)"  # пункт списку: лігу не вибрано, показуємо всі клуби
+
+
+@st.cache_data(show_spinner=False)
+def get_team_leagues() -> dict[str, str]:
+    """Остання ліга кожного клубу — потрібна, коли користувач не вибрав лігу."""
+    history = pr.match_history("clubs")
+    last = pd.concat([history[["date", "home", "competition"]].rename(columns={"home": "team"}),
+                      history[["date", "away", "competition"]].rename(columns={"away": "team"})])
+    return last.sort_values("date").groupby("team")["competition"].last().to_dict()
+
+
 def match_inputs(track: str) -> dict:
     """Форма вводу матчу в боковій панелі; повертає параметри для predict_details."""
     defaults = DEFAULTS[track]
     comps = get_competitions(track)
+    if track == "clubs":
+        comps = [ALL_LEAGUES] + comps
     competition = st.sidebar.selectbox(
         "Ліга" if track == "clubs" else "Турнір", comps,
         index=default_index(comps, defaults["competition"]),
-        format_func=lambda c: competition_label(track, c), key=f"comp_{track}")
-    team_list = get_teams(track, competition)
+        format_func=lambda c: c if c == ALL_LEAGUES else competition_label(track, c), key=f"comp_{track}",
+        help="Виберіть «(усі ліги)», щоб обирати з усіх клубів одразу." if track == "clubs" else None)
+    all_leagues = competition == ALL_LEAGUES
+    team_list = sorted(get_team_leagues()) if all_leagues else get_teams(track, competition)
     if len(team_list) < 2:
         st.sidebar.warning("Для цієї ліги замало команд в історії")
         return {}
@@ -310,6 +326,10 @@ def match_inputs(track: str) -> dict:
                                 index=default_index(team_list, defaults["home"], 0))
     away = st.sidebar.selectbox("Гості", team_list, key=f"away_{track}_{competition}",
                                 index=default_index(team_list, defaults["away"], 1))
+    if all_leagues:
+        competition = get_team_leagues()[home]
+        st.sidebar.caption(f"Лігу не вибрано — показано всі клуби. Для розрахунку взято останню лігу господарів: "
+                           f"{competition_label(track, competition)}.")
     date = st.sidebar.date_input("Дата матчу", value=dt.date.today(), min_value=MIN_DATE,
                                  max_value=MAX_DATE, key="date")
     params = {"home": home, "away": away, "date": pd.Timestamp(date), "competition": competition,
@@ -720,16 +740,23 @@ def get_combined_preds(mtime: float) -> pd.DataFrame:
     return pd.read_csv(COMBINED_PREDS, parse_dates=["date"]).sort_values("date", ascending=False)
 
 
-def metric_bars(df: pd.DataFrame, column: str, title: str, fmt: str, zoom: tuple[float, float]) -> alt.Chart:
-    """Горизонтальні стовпчики одного показника для всіх моделей."""
-    base = alt.Chart(df).encode(
-        y=alt.Y("Модель:N", sort=list(df["Модель"]), axis=alt.Axis(title=None, labelLimit=220, labelFontSize=14)),
-        x=alt.X(f"{column}:Q", scale=alt.Scale(domain=list(zoom)), axis=alt.Axis(format=fmt, title=title)),
+def metric_bars(df: pd.DataFrame, column: str, fmt: str, zoom: tuple[float, float]) -> alt.Chart:
+    """Горизонтальні стовпчики одного показника для всіх моделей.
+
+    Шкала починається не з нуля (zoom), щоб було видно різницю між близькими моделями, тому стовпчик
+    малюється явно від лівої межі шкали. Підпис — білим усередині стовпчика: читається на обох темах.
+    """
+    data = df.assign(left=zoom[0])
+    base = alt.Chart(data).encode(
+        y=alt.Y("Модель:N", sort=list(df["Модель"]), axis=alt.Axis(title=None, labelLimit=240, labelFontSize=14)),
         tooltip=["Модель", "Що це", alt.Tooltip(f"{column}:Q", format=fmt)])
-    bars = base.mark_bar(clip=True, cornerRadiusEnd=4).encode(color=alt.Color("Колір:N", scale=None))
-    text = base.mark_text(align="left", dx=6, fontSize=14, fontWeight="bold").encode(
-        text=alt.Text(f"{column}:Q", format=fmt))
-    return (bars + text).properties(height=46 * len(df))
+    bars = base.mark_bar(cornerRadiusEnd=4, height=30).encode(
+        x=alt.X("left:Q", scale=alt.Scale(domain=list(zoom), nice=False), axis=alt.Axis(format=fmt, title=None)),
+        x2=alt.X2(column),
+        color=alt.Color("Колір:N", scale=None))
+    text = base.mark_text(align="right", dx=-8, fontSize=15, fontWeight="bold", color="#ffffff").encode(
+        x=alt.X(f"{column}:Q"), text=alt.Text(f"{column}:Q", format=fmt))
+    return (bars + text).properties(height=48 * len(df))
 
 
 def combined_cards(df: pd.DataFrame) -> None:
@@ -786,10 +813,10 @@ def show_combined() -> None:
                "Моделі цих матчів під час навчання не бачили; усі оцінено на тих самих матчах.")
     combined_cards(df)
     st.markdown("##### Точність: частка вгаданих матчів (більше — краще)")
-    st.altair_chart(metric_bars(df, "accuracy", "Точність", ".1%", (0.40, 0.56)), width="stretch")
+    st.altair_chart(metric_bars(df, "accuracy", ".1%", (0.38, 0.56)), width="stretch")
     with st.expander("Якість імовірностей (log-loss, менше — краще)"):
         ordered = df.sort_values("log_loss", ascending=False).reset_index(drop=True)
-        st.altair_chart(metric_bars(ordered, "log_loss", "Log-loss", ".4f", (0.95, 1.08)), width="stretch")
+        st.altair_chart(metric_bars(ordered, "log_loss", ".4f", (0.92, 1.08)), width="stretch")
     st.markdown(
         "**Чому разом краще.** Альфа знає, наскільки сильна команда загалом. Бета знає, хто саме вийшов на поле. "
         "Це різна інформація, тому разом моделі помиляються рідше, ніж кожна окремо.")
