@@ -1,0 +1,236 @@
+import argparse
+import bisect
+import difflib
+import pickle
+import unicodedata
+
+import numpy as np
+import pandas as pd
+
+
+def _norm(text):
+    s = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
+    return " ".join(s.lower().strip().split())
+
+
+def _exp(diff):
+    return 1.0 / (1.0 + 10.0 ** (-np.clip(diff, -1200.0, 1200.0) / 400.0))
+
+
+def pair_features(h, a, comp, hfa=65.0):
+    f = {}
+    f["elo_diff"] = h["elo_p"] - a["elo_p"]
+    f["abs_elo_diff"] = abs(f["elo_diff"])
+    f["elo_exp"] = _exp(f["elo_diff"] + hfa)
+    f["elo_mean"] = 0.5 * (h["elo_p"] + a["elo_p"])
+    f["elo_mom_diff"] = h["elo_mom"] - a["elo_mom"]
+    f["comp_elo_diff"] = h["comp_elo"] - a["comp_elo"]
+
+    f["joint_club_diff"] = h["elo_j"] - a["elo_j"]
+    f["joint_diff"] = (h["elo_j"] + h["adj"]) - (a["elo_j"] + a["adj"])
+    f["abs_joint_diff"] = abs(f["joint_diff"])
+    f["joint_exp"] = _exp(f["joint_diff"] + hfa)
+
+    f["lineup_adj_diff"] = h["adj"] - a["adj"]
+    f["lineup_vs_usual_h"] = h["adj"] - h["adj_usual"]
+    f["lineup_vs_usual_a"] = a["adj"] - a["adj_usual"]
+    f["lineup_vs_usual_diff"] = f["lineup_vs_usual_h"] - f["lineup_vs_usual_a"]
+
+    f["xi_cont_h"] = h["xi_cont"]
+    f["xi_cont_a"] = a["xi_cont"]
+    f["xi_cont_diff"] = h["xi_cont"] - a["xi_cont"]
+    f["prev_overlap_h"] = h["prev_overlap"]
+    f["prev_overlap_a"] = a["prev_overlap"]
+
+    f["missing_h"] = h["missing"]
+    f["missing_a"] = a["missing"]
+    f["missing_diff"] = h["missing"] - a["missing"]
+    f["unseen_h"] = h["unseen"]
+    f["unseen_a"] = a["unseen"]
+    f["bench_diff"] = h["bench"] - a["bench"]
+
+    f["ppg_diff"] = h["ppg"] - a["ppg"]
+    f["gdf_diff"] = h["gdf"] - a["gdf"]
+    f["gf_diff"] = h["gf_ema"] - a["gf_ema"]
+    f["ga_diff"] = h["ga_ema"] - a["ga_ema"]
+
+    f["rest_h"] = h["rest"]
+    f["rest_a"] = a["rest"]
+    f["rest_diff"] = h["rest"] - a["rest"]
+    f["short_rest_h"] = float(h["rest"] <= 4.0) if not np.isnan(h["rest"]) else np.nan
+    f["short_rest_a"] = float(a["rest"] <= 4.0) if not np.isnan(a["rest"]) else np.nan
+    f["n_min"] = min(h["n"], a["n"])
+
+    f["comp_home_rate"] = comp[0]
+    f["comp_draw_rate"] = comp[1]
+    f["comp_goals_pg"] = comp[2]
+    return f
+
+
+def _snap_at(bundle, club_id, as_of):
+    dates = bundle["snap_dates"].get(club_id)
+    if not dates:
+        return None
+    i = bisect.bisect_left(dates, as_of) - 1
+    return dict(bundle["snap_vals"][club_id][i]) if i >= 0 else None
+
+
+def resolve_club(query, bundle, interactive=False):
+    q = _norm(query)
+    active = {cid: name for cid, name in bundle["club_names"].items() if cid in bundle["snap_dates"]}
+
+    exact = [(cid, name) for cid, name in active.items() if _norm(name) == q]
+    if len(exact) == 1:
+        return exact[0]
+
+    sub = [(cid, name) for cid, name in active.items() if q in _norm(name)]
+    if len(sub) == 1:
+        return sub[0]
+
+    if not sub:
+        norm_to_items = {}
+        for cid, name in active.items():
+            norm_to_items.setdefault(_norm(name), []).append((cid, name))
+        close = difflib.get_close_matches(q, list(norm_to_items.keys()), n=5, cutoff=0.55)
+        sub = [item for k in close for item in norm_to_items[k]]
+
+    if not sub:
+        raise ValueError(f"No club found matching '{query}'. Try --search <name>.")
+
+    if len(sub) > 1:
+        sub = sorted(sub, key=lambda x: len(x[1]))[:10]
+        if interactive:
+            print(f"\nMultiple clubs match '{query}':")
+            for idx, (cid, name) in enumerate(sub, 1):
+                comp = bundle["club_primary_comp"].get(cid, "?")
+                print(f"  {idx}. {name} ({comp})")
+            choice = int(input("Pick number: ").strip()) - 1
+            return sub[choice]
+        names_str = ", ".join(f"{name} ({bundle['club_primary_comp'].get(cid, '?')})" for cid, name in sub)
+        raise ValueError(f"Ambiguous team '{query}'. Matches: {names_str}")
+
+    return sub[0]
+
+
+def predict_match(bundle, home_query, away_query, comp_id=None, as_of=None, rest_home=None, rest_away=None, interactive=False):
+    as_of_ts = pd.Timestamp(as_of) if as_of else bundle["last_date"] + pd.Timedelta(days=1)
+
+    h_id, h_name = resolve_club(home_query, bundle, interactive=interactive)
+    a_id, a_name = resolve_club(away_query, bundle, interactive=interactive)
+    if h_id == a_id:
+        raise ValueError("Home and away teams must be different.")
+
+    hs = _snap_at(bundle, h_id, as_of_ts)
+    as_ = _snap_at(bundle, a_id, as_of_ts)
+    if hs is None or as_ is None:
+        raise ValueError(f"Missing snapshot prior to {as_of_ts.date()} for one of the clubs.")
+
+    if rest_home is not None:
+        hs["rest"] = float(rest_home)
+    if rest_away is not None:
+        as_["rest"] = float(rest_away)
+
+    h_comp = bundle["club_primary_comp"].get(h_id)
+    a_comp = bundle["club_primary_comp"].get(a_id)
+    if not comp_id:
+        if h_comp and h_comp == a_comp:
+            comp_id = h_comp
+            comp_source = f"{comp_id} (auto-detected)"
+        else:
+            comp_id = "DEFAULT"
+            comp_source = "inter-league / default"
+    else:
+        comp_source = comp_id
+
+    comp_stats = bundle["comp_map"].get(comp_id, bundle["comp_default"])
+    feat = pair_features(hs, as_, comp_stats, hfa=bundle["hfa"])
+    X = pd.DataFrame([feat])[bundle["cols"]].astype(float)
+    P = bundle["model"].predict_proba(X)[0]
+
+    return dict(
+        as_of=str(as_of_ts.date()),
+        competition=comp_source,
+        home=h_name,
+        away=a_name,
+        home_elo=round(hs["elo_p"], 1),
+        away_elo=round(as_["elo_p"], 1),
+        p_home=float(P[0]),
+        p_draw=float(P[1]),
+        p_away=float(P[2]),
+    )
+
+
+def print_prediction(res):
+    labels = ["Home Win", "Draw", "Away Win"]
+    probs = [res["p_home"], res["p_draw"], res["p_away"]]
+    best_idx = int(np.argmax(probs))
+
+    print("\n" + "=" * 54)
+    print(f"  {res['home']}  vs  {res['away']}")
+    print(f"  As of: {res['as_of']}  |  Competition: {res['competition']}")
+    print(f"  Elo:   {res['home_elo']} vs {res['away_elo']}")
+    print("-" * 54)
+    for lbl, p in zip(labels, probs):
+        bar = "#" * int(round(p * 30))
+        odds = 1.0 / max(p, 1e-6)
+        print(f"  {lbl:<10} {p*100:6.2f}%  (fair odds {odds:5.2f})  {bar}")
+    print("-" * 54)
+    print(f"  Predicted outcome : {labels[best_idx]} ({probs[best_idx]*100:.1f}%)")
+    print("=" * 54 + "\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Predict football match outcome from out/predictor.pkl")
+    parser.add_argument("home", nargs="?", help="Home team name")
+    parser.add_argument("away", nargs="?", help="Away team name")
+    parser.add_argument("--model", default="out/predictor.pkl", help="Path to saved predictor.pkl")
+    parser.add_argument("--comp", default=None, help="Optional competition ID (e.g. GB1, L1, CL)")
+    parser.add_argument("--date", default=None, help="Optional date YYYY-MM-DD (defaults to latest)")
+    parser.add_argument("--rest-home", type=float, default=None, help="Optional rest days for home team")
+    parser.add_argument("--rest-away", type=float, default=None, help="Optional rest days for away team")
+    parser.add_argument("--search", default=None, help="Search club names matching query")
+    args = parser.parse_args()
+
+    with open(args.model, "rb") as fh:
+        bundle = pickle.load(fh)
+
+    if args.search:
+        q = _norm(args.search)
+        matches = sorted(
+            (name, bundle["club_primary_comp"].get(cid, "?"))
+            for cid, name in bundle["club_names"].items()
+            if q in _norm(name) and cid in bundle["snap_dates"]
+        )
+        for name, comp in matches[:30]:
+            print(f"  {name} ({comp})")
+        raise SystemExit(0)
+
+    if args.home and args.away:
+        res = predict_match(
+            bundle, args.home, args.away,
+            comp_id=args.comp, as_of=args.date,
+            rest_home=args.rest_home, rest_away=args.rest_away,
+            interactive=False,
+        )
+        print_prediction(res)
+    else:
+        print("\n=== Match Predictor (press Enter on Home team to quit) ===")
+        while True:
+            try:
+                h_q = input("Home team: ").strip()
+                if not h_q or h_q.lower() in ("q", "quit", "exit"):
+                    break
+                a_q = input("Away team: ").strip()
+                if not a_q or a_q.lower() in ("q", "quit", "exit"):
+                    break
+                comp_q = input("Competition ID (optional, Enter for auto): ").strip() or None
+                res = predict_match(
+                    bundle, h_q, a_q, comp_id=comp_q, as_of=args.date,
+                    rest_home=args.rest_home, rest_away=args.rest_away,
+                    interactive=True,
+                )
+                print_prediction(res)
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as e:
+                print(f"Error: {e}\n")
