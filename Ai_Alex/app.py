@@ -10,6 +10,10 @@ import re
 from pathlib import Path
 
 import altair as alt
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -438,6 +442,9 @@ def show_prediction(params: dict) -> None:
     with st.expander(f"Усі ознаки моделі ({res.features.shape[1]})"):
         st.dataframe(all_features_table(res), hide_index=True, width="stretch")
     show_recent(params)
+    st.markdown("#### Графік прогнозу")
+    plot_col, _ = st.columns([2, 1])
+    plot_col.pyplot(mpl_proba_figure(proba, f"{home} — {away}: імовірності результатів"), clear_figure=True)
 
 
 # ---------------------------------------------------------------- вкладка «Перевірка на історії»
@@ -472,7 +479,7 @@ def backtest_table(bt: pd.DataFrame) -> pd.DataFrame:
         "Рахунок": bt["home_goals"].astype(int).astype(str) + ":" + bt["away_goals"].astype(int).astype(str),
         "П1": bt["p_H"].map("{:.0%}".format), "Х": bt["p_D"].map("{:.0%}".format), "П2": bt["p_A"].map("{:.0%}".format),
         "Прогноз": bt["pred"].map(OUTCOME_LABELS), "Факт": bt["target"].map(OUTCOME_LABELS),
-        "Вгадано": bt["hit"].map({True: "✅", False: "❌"}),
+        "Вгадано": bt["hit"].map({True: "так", False: "ні"}),
     })
 
 
@@ -481,7 +488,7 @@ def show_backtest_match(row: pd.Series) -> None:
     score = f"{int(row['home_goals'])}:{int(row['away_goals'])}"
     st.subheader(f"{row['home']} {score} {row['away']}")
     model = _row_proba(row, "p")
-    verdict = "✅ вгадала" if row["hit"] else "❌ не вгадала"
+    verdict = "вгадала" if row["hit"] else "не вгадала"
     st.caption(f"{row['date']:%d.%m.%Y} · факт: {OUTCOME_LABELS[row['target']]} · "
                f"модель ({verdict}): {OUTCOME_LABELS[row['pred']]}")
     left, right = st.columns([3, 2])
@@ -600,18 +607,221 @@ def show_quality() -> None:
         st.image(str(fig), caption=fig.stem, width="stretch")
 
 
+# ---------------------------------------------------------------- графіки matplotlib
+
+MPL_TEXT = "#444444"
+
+
+def _style_axes(ax) -> None:
+    """Єдиний спокійний стиль осей для всіх графіків matplotlib."""
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(colors=MPL_TEXT, labelsize=9)
+    ax.grid(axis="y", alpha=0.25)
+    ax.set_axisbelow(True)
+
+
+def mpl_proba_figure(proba: dict[str, float], title: str):
+    """Стовпчики ймовірностей H/D/A одного прогнозу."""
+    fig, ax = plt.subplots(figsize=(6, 3))
+    labels = [OUTCOME_LABELS[k] for k in proba]
+    bars = ax.bar(labels, [v * 100 for v in proba.values()], color=[OUTCOME_COLORS[k] for k in proba], width=0.55)
+    ax.bar_label(bars, fmt="%.1f%%", padding=3, fontsize=10, color=MPL_TEXT)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Імовірність, %", color=MPL_TEXT, fontsize=9)
+    ax.set_title(title, fontsize=11, color=MPL_TEXT, loc="left")
+    _style_axes(ax)
+    fig.tight_layout()
+    return fig
+
+
+def mpl_match_figure(row: pd.Series):
+    """Імовірності трьох моделей для одного матчу, згруповані за результатом."""
+    fig, ax = plt.subplots(figsize=(6, 3.4))
+    x = np.arange(len(config.CLASSES))
+    width = 0.26
+    for i, (key, label) in enumerate(MATCH_MODELS.items()):
+        values = [float(row[f"{key}_{cls}"]) * 100 for cls in config.CLASSES]
+        bars = ax.bar(x + (i - 1) * width, values, width, label=label, color=MATCH_COLORS[key])
+        ax.bar_label(bars, fmt="%.0f", padding=2, fontsize=8, color=MPL_TEXT)
+    ax.axvspan(config.CLASSES.index(row["target"]) - 0.45, config.CLASSES.index(row["target"]) + 0.45,
+               color="#000000", alpha=0.06)
+    ax.set_xticks(x, [OUTCOME_LABELS[c] for c in config.CLASSES])
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Імовірність, %", color=MPL_TEXT, fontsize=9)
+    ax.set_title(f"{row['home']} — {row['away']}: прогнози моделей (сірим — фактичний результат)",
+                 fontsize=10, color=MPL_TEXT, loc="left")
+    ax.legend(frameon=False, fontsize=8)
+    _style_axes(ax)
+    fig.tight_layout()
+    return fig
+
+
+def mpl_hits_figure(hits: dict[str, int], total: int):
+    """Скільки матчів ліги вгадала кожна модель."""
+    fig, ax = plt.subplots(figsize=(6, 3.4))
+    bars = ax.bar(list(hits), list(hits.values()), color=list(MATCH_COLORS.values()), width=0.5)
+    ax.bar_label(bars, labels=[f"{v} з {total}" for v in hits.values()], padding=3, fontsize=10, color=MPL_TEXT)
+    ax.set_ylim(0, total)
+    ax.set_ylabel("Вгадано матчів", color=MPL_TEXT, fontsize=9)
+    ax.set_title(f"Вгадані результати в останніх {total} матчах ліги", fontsize=10, color=MPL_TEXT, loc="left")
+    _style_axes(ax)
+    fig.tight_layout()
+    return fig
+
+
+def mpl_accuracy_figure(df: pd.DataFrame):
+    """Точність усіх моделей на тесті одним графіком."""
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    bars = ax.bar(df["Модель"], df["accuracy"] * 100, color=df["Колір"], width=0.6)
+    ax.bar_label(bars, fmt="%.1f%%", padding=3, fontsize=10, color=MPL_TEXT)
+    ax.set_ylim(40, 57)
+    ax.set_ylabel("Точність, %", color=MPL_TEXT, fontsize=9)
+    ax.set_title("Точність моделей на 9 996 матчах тесту (вісь починається з 40%)",
+                 fontsize=11, color=MPL_TEXT, loc="left")
+    ax.tick_params(axis="x", labelsize=8)
+    _style_axes(ax)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------- об'єднання моделей
+
+COMBINED_METRICS = config.REPORTS / "combined_metrics.csv"
+COMBINED_PREDS = config.REPORTS / "combined_test_preds.csv"
+# підпис у файлі метрик → (коротка назва, колір, пояснення)
+COMBINED_MODELS = {
+    "завжди господарі": ("Завжди господарі", "#9e9e9e", "завжди ставити на перемогу господарів"),
+    "ознаки складів (модель учасника)": ("Модель Бета", "#1565c0", "рейтинг кожного гравця і сила стартового складу"),
+    "наші ознаки (з історією ринку)": ("Модель Альфа", "#ef6c00", "рейтинги команд, форма, історія коефіцієнтів, вартість складу"),
+    "ОБ'ЄДНАНА: наші + склади": ("Альфа + Бета", "#2e7d32", "одна модель на ознаках Альфи й Бети"),
+    "ринок (коефіцієнти БК)": ("Букмекери", "#6a1b9a", "імовірності з коефіцієнтів, для порівняння"),
+    "об'єднана + коефіцієнти БК": ("Альфа + Бета + коефіцієнти", "#1b5e20", "та сама модель, якій відомі коефіцієнти матчу"),
+}
+MATCH_MODELS = {"own": "Модель Альфа", "lineup": "Модель Бета", "combined": "Альфа + Бета"}
+MATCH_COLORS = {"own": "#ef6c00", "lineup": "#1565c0", "combined": "#2e7d32"}
+RECENT_MATCHES = 60  # скільки останніх матчів ліги показувати у виборі
+
+
+@st.cache_data(show_spinner=False)
+def get_combined_metrics(mtime: float) -> pd.DataFrame:
+    """Метрики моделей на спільних матчах тесту (mtime — щоб кеш оновлювався разом із файлом)."""
+    df = pd.read_csv(COMBINED_METRICS)
+    df = df[df["модель"].isin(COMBINED_MODELS)].copy()
+    df["Модель"] = df["модель"].map(lambda m: COMBINED_MODELS[m][0])
+    df["Колір"] = df["модель"].map(lambda m: COMBINED_MODELS[m][1])
+    df["Що це"] = df["модель"].map(lambda m: COMBINED_MODELS[m][2])
+    return df.sort_values("accuracy").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def get_combined_preds(mtime: float) -> pd.DataFrame:
+    """Прогнози трьох моделей для кожного матчу тесту."""
+    return pd.read_csv(COMBINED_PREDS, parse_dates=["date"]).sort_values("date", ascending=False)
+
+
+def metric_bars(df: pd.DataFrame, column: str, title: str, fmt: str, zoom: tuple[float, float]) -> alt.Chart:
+    """Горизонтальні стовпчики одного показника для всіх моделей."""
+    base = alt.Chart(df).encode(
+        y=alt.Y("Модель:N", sort=list(df["Модель"]), axis=alt.Axis(title=None, labelLimit=220, labelFontSize=14)),
+        x=alt.X(f"{column}:Q", scale=alt.Scale(domain=list(zoom)), axis=alt.Axis(format=fmt, title=title)),
+        tooltip=["Модель", "Що це", alt.Tooltip(f"{column}:Q", format=fmt)])
+    bars = base.mark_bar(clip=True, cornerRadiusEnd=4).encode(color=alt.Color("Колір:N", scale=None))
+    text = base.mark_text(align="left", dx=6, fontSize=14, fontWeight="bold").encode(
+        text=alt.Text(f"{column}:Q", format=fmt))
+    return (bars + text).properties(height=46 * len(df))
+
+
+def combined_cards(df: pd.DataFrame) -> None:
+    """Три великі показники: дві моделі окремо та їх об'єднання."""
+    acc = df.set_index("Модель")["accuracy"]
+    mine, other, both = acc["Модель Альфа"], acc["Модель Бета"], acc["Альфа + Бета"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Модель Альфа", f"{mine:.1%}", help=COMBINED_MODELS["наші ознаки (з історією ринку)"][2])
+    c2.metric("Модель Бета", f"{other:.1%}", help=COMBINED_MODELS["ознаки складів (модель учасника)"][2])
+    c3.metric("Альфа + Бета", f"{both:.1%}",
+              delta=f"+{(both - mine) * 100:.1f} п.п. до Альфи, +{(both - other) * 100:.1f} п.п. до Бети")
+
+
+def combined_match(preds: pd.DataFrame) -> None:
+    """Один реальний матч тесту: прогнози трьох моделей поруч і фактичний результат."""
+    st.subheader("Три моделі на одному матчі")
+    left, right = st.columns([1, 2])
+    leagues = sorted(preds["competition"].unique(), key=lambda c: (c not in config.TOP5, c))
+    league = left.selectbox("Ліга", leagues, format_func=lambda c: competition_label("clubs", c), key="cmb_league")
+    sub = preds[preds["competition"] == league].head(RECENT_MATCHES).reset_index(drop=True)
+    idx = right.selectbox(f"Матч (останні {RECENT_MATCHES} у тесті)", sub.index, key="cmb_match", format_func=lambda i: (
+        f"{sub.at[i, 'date']:%d.%m.%Y}  {sub.at[i, 'home']} {int(sub.at[i, 'home_goals'])}:"
+        f"{int(sub.at[i, 'away_goals'])} {sub.at[i, 'away']}"))
+    row = sub.loc[idx]
+    st.markdown(f"**Фактичний результат:** {OUTCOME_LABELS[row['target']]} "
+                f"({int(row['home_goals'])}:{int(row['away_goals'])})")
+    actual = sub["target"].map(config.CLASSES.index).to_numpy()
+    hits = {}
+    for col, (key, label) in zip(st.columns(3), MATCH_MODELS.items()):
+        proba = {cls: float(row[f"{key}_{cls}"]) for cls in config.CLASSES}
+        hit = max(proba, key=proba.get) == row["target"]
+        col.markdown(f"**{label}**: {'вгадала' if hit else 'не вгадала'}")
+        col.altair_chart(proba_chart(proba, height=230), width="stretch")
+        hits[label] = int((sub[[f"{key}_{c}" for c in config.CLASSES]].to_numpy().argmax(axis=1) == actual).sum())
+    st.caption(f"У цих {len(sub)} матчах ліги вгадано: " + ", ".join(f"{k} — {v}" for k, v in hits.items()))
+    st.markdown("##### Графіки")
+    left_plot, right_plot = st.columns(2)
+    left_plot.pyplot(mpl_match_figure(row), clear_figure=True)
+    right_plot.pyplot(mpl_hits_figure(hits, len(sub)), clear_figure=True)
+
+
+def show_combined() -> None:
+    """Вкладка «Об'єднання моделей»: що дала кожна модель окремо і разом."""
+    if not COMBINED_METRICS.exists():
+        st.info("Результатів об'єднання ще немає — запустіть `python -m src.combined`.")
+        return
+    df = get_combined_metrics(COMBINED_METRICS.stat().st_mtime)
+    st.subheader("Модель Альфа, модель Бета і їх об'єднання")
+    st.markdown(
+        "- **Модель Альфа** оцінює силу команд: рейтинги, форма, історія коефіцієнтів, вартість складу.\n"
+        "- **Модель Бета** оцінює стартовий склад: рейтинг кожного гравця, хто відсутній, ротація.\n"
+        "- **Альфа + Бета** — одна модель, навчена на ознаках обох.")
+    st.caption("Числа нижче — частка вгаданих результатів на 9 996 матчах з 01.07.2023. "
+               "Моделі цих матчів під час навчання не бачили; усі оцінено на тих самих матчах.")
+    combined_cards(df)
+    st.markdown("##### Точність: частка вгаданих матчів (більше — краще)")
+    st.altair_chart(metric_bars(df, "accuracy", "Точність", ".1%", (0.40, 0.56)), width="stretch")
+    with st.expander("Якість імовірностей (log-loss, менше — краще)"):
+        ordered = df.sort_values("log_loss", ascending=False).reset_index(drop=True)
+        st.altair_chart(metric_bars(ordered, "log_loss", "Log-loss", ".4f", (0.95, 1.08)), width="stretch")
+    st.markdown(
+        "**Чому разом краще.** Альфа знає, наскільки сильна команда загалом. Бета знає, хто саме вийшов на поле. "
+        "Це різна інформація, тому разом моделі помиляються рідше, ніж кожна окремо.")
+    st.caption("Стартовий склад оголошують приблизно за годину до гри, тож прогноз Альфа + Бета можливий лише після цього. "
+               "Порівняння охоплює ліги, де відомі склади, — переважно топ-ліги.")
+    if COMBINED_PREDS.exists():
+        combined_match(get_combined_preds(COMBINED_PREDS.stat().st_mtime))
+    st.pyplot(mpl_accuracy_figure(df), clear_figure=True)
+
+
 # ---------------------------------------------------------------- точка входу
 
 def main() -> None:
     """Точка входу Streamlit."""
-    st.set_page_config(page_title="Прогноз футбольного матчу", page_icon="⚽", layout="wide")
-    st.title("⚽ Прогноз результату футбольного матчу")
-    st.caption("Ймовірності перемоги господарів / нічиєї / перемоги гостей на основі Elo, форми та історії зустрічей")
+    st.set_page_config(page_title="Прогноз футбольного матчу", layout="wide")
+    st.title("Прогноз результату футбольного матчу")
+    st.caption("Імовірності перемоги господарів, нічиєї та перемоги гостей. Модель бачить лише те, що відомо до матчу.")
+    with st.expander("Як користуватися"):
+        st.markdown(
+            "- **Ліворуч** оберіть клуби чи збірні, лігу, дві команди й дату матчу.\n"
+            "- **Прогноз**: імовірності трьох результатів і дані, з яких їх пораховано.\n"
+            "- **Порівняння моделей**: точність моделі Альфа, моделі Бета і їх об'єднання.\n"
+            "- **Перевірка на історії**: зіграні матчі — що казала модель і чим закінчилось.\n"
+            "- **Якість моделі**: точність на матчах, яких модель не бачила, і розбір помилок.")
     with st.spinner("Завантажую історію матчів, рейтинги Elo та pi… (лише під час першого запуску, ~15 с)"):
         warm_up()
     track = st.sidebar.radio("Трек", list(TRACK_LABELS), format_func=TRACK_LABELS.get, horizontal=True, key="track")
     params = match_inputs(track)
-    tab_pred, tab_bt, tab_quality = st.tabs(["Прогноз", "Перевірка на історії", "Якість моделі"])
+    tab_pred, tab_combined, tab_bt, tab_quality = st.tabs(
+        ["Прогноз", "Порівняння моделей", "Перевірка на історії", "Якість моделі"])
+    with tab_combined:
+        show_combined()
     with tab_pred:
         if params:
             show_prediction(params)
