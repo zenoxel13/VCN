@@ -13,3 +13,4 @@ nbformat
 nbconvert
 ipykernel
 pytest
+tabulate
