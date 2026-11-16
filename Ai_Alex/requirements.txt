@@ -1,0 +1,15 @@
+pandas
+numpy
+pyarrow
+scikit-learn
+lightgbm
+matplotlib
+seaborn
+streamlit
+requests
+joblib
+shap
+nbformat
+nbconvert
+ipykernel
+pytest
