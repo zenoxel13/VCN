@@ -2,13 +2,11 @@ import argparse
 import ast
 import bisect
 import copy
-import difflib
 import inspect
 import json
 import math
 import os
 import pickle
-import unicodedata
 from collections import Counter, defaultdict, deque
 
 import numpy as np
@@ -51,11 +49,6 @@ META = [
 LINEUP_TOKENS = (
     "lineup", "missing", "unseen", "bench", "joint", "xi_cont", "prev_overlap"
 )
-
-
-def _norm(text):
-    s = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
-    return " ".join(s.lower().strip().split())
 
 
 def _as_list(x):
@@ -835,14 +828,13 @@ def plot_window_calibration(test_probs, yte, path):
 
 class RatingSystem:
     def __init__(self, model, feature_cols, snap_dates, snap_vals, feats, comp_default,
-                 club_names=None, hfa=CFG["hfa"], comp_map=None, club_primary_comp=None):
+                 club_names=None, hfa=CFG["hfa"], comp_map=None):
         self.model, self.cols = model, feature_cols
         self.snap_dates, self.snap_vals = dict(snap_dates), dict(snap_vals)
         self.comp_default = comp_default
         self.club_names = club_names or {}
         self.hfa = hfa
         self.comp_map = comp_map or {}
-        self.club_primary_comp = club_primary_comp or {}
         self.season_end = feats.groupby("season").date.max().to_dict()
         self.season_clubs = {}
         for (s, c), g in feats.groupby(["season", "competition_id"]):
@@ -855,90 +847,6 @@ class RatingSystem:
             return None
         i = bisect.bisect_left(dates, as_of) - 1
         return dict(self.snap_vals[club][i]) if i >= 0 else None
-
-    def resolve_club(self, query, interactive=False):
-        q = _norm(query)
-        active = {cid: name for cid, name in self.club_names.items() if cid in self.snap_dates}
-
-        exact = [(cid, name) for cid, name in active.items() if _norm(name) == q]
-        if len(exact) == 1:
-            return exact[0]
-
-        sub = [(cid, name) for cid, name in active.items() if q in _norm(name)]
-        if len(sub) == 1:
-            return sub[0]
-
-        if not sub:
-            norm_to_items = {}
-            for cid, name in active.items():
-                norm_to_items.setdefault(_norm(name), []).append((cid, name))
-            close = difflib.get_close_matches(q, list(norm_to_items.keys()), n=5, cutoff=0.55)
-            sub = [item for k in close for item in norm_to_items[k]]
-
-        if not sub:
-            raise ValueError(f"No club found matching '{query}'.")
-
-        if len(sub) > 1:
-            sub = sorted(sub, key=lambda x: len(x[1]))[:10]
-            if interactive:
-                print(f"\nMultiple clubs match '{query}':")
-                for idx, (cid, name) in enumerate(sub, 1):
-                    comp = self.club_primary_comp.get(cid, "?")
-                    print(f"  {idx}. {name} ({comp})")
-                choice = int(input("Pick number: ").strip()) - 1
-                return sub[choice]
-            names_str = ", ".join(f"{name} ({self.club_primary_comp.get(cid, '?')})" for cid, name in sub)
-            raise ValueError(f"Ambiguous team '{query}'. Matches: {names_str}")
-
-        return sub[0]
-
-    def predict_match(self, home_query, away_query, competition_id=None, as_of=None,
-                      rest_home=None, rest_away=None, interactive=False):
-        as_of_ts = pd.Timestamp(as_of) if as_of else self.last_date + pd.Timedelta(days=1)
-
-        h_id, h_name = self.resolve_club(home_query, interactive=interactive)
-        a_id, a_name = self.resolve_club(away_query, interactive=interactive)
-        if h_id == a_id:
-            raise ValueError("Home and away teams must be different.")
-
-        hs = self._snap_at(h_id, as_of_ts)
-        as_ = self._snap_at(a_id, as_of_ts)
-        if hs is None or as_ is None:
-            raise ValueError(f"Missing snapshot prior to {as_of_ts.date()} for one of the clubs.")
-
-        if rest_home is not None:
-            hs["rest"] = float(rest_home)
-        if rest_away is not None:
-            as_["rest"] = float(rest_away)
-
-        h_comp = self.club_primary_comp.get(h_id)
-        a_comp = self.club_primary_comp.get(a_id)
-        if not competition_id:
-            if h_comp and h_comp == a_comp:
-                competition_id = h_comp
-                comp_source = f"{competition_id} (auto-detected)"
-            else:
-                competition_id = "DEFAULT"
-                comp_source = "inter-league / default"
-        else:
-            comp_source = competition_id
-
-        comp_stats = self.comp_map.get(competition_id, self.comp_default)
-        feat = pair_features(hs, as_, comp_stats, hfa=self.hfa)
-        X = pd.DataFrame([feat])[self.cols].astype(float)
-        P = self.model.predict_proba(X)[0]
-
-        return dict(
-            as_of=str(as_of_ts.date()),
-            competition=comp_source,
-            home=h_name,
-            away=a_name,
-            home_elo=round(hs["elo_p"], 1),
-            away_elo=round(as_["elo_p"], 1),
-            p_home=float(P[0]),
-            p_draw=float(P[1]),
-            p_away=float(P[2]),
-        )
 
     def ratings(self, as_of=None, season=None, competition_id=None, active_days=365, min_clubs=2, min_games=10, n_bench=15):
         if season is not None:
@@ -1000,25 +908,6 @@ class RatingSystem:
         out.insert(0, "rank", np.arange(1, len(out) + 1))
         out.attrs["as_of"] = as_of
         return out
-
-
-def print_match_prediction(res):
-    labels = ["Home Win", "Draw", "Away Win"]
-    probs = [res["p_home"], res["p_draw"], res["p_away"]]
-    best_idx = int(np.argmax(probs))
-
-    print("\n" + "=" * 54)
-    print(f"  {res['home']}  vs  {res['away']}")
-    print(f"  As of: {res['as_of']}  |  Competition: {res['competition']}")
-    print(f"  Elo:   {res['home_elo']} vs {res['away_elo']}")
-    print("-" * 54)
-    for lbl, p in zip(labels, probs):
-        bar = "#" * int(round(p * 30))
-        odds = 1.0 / max(p, 1e-6)
-        print(f"  {lbl:<10} {p*100:6.2f}%  (fair odds {odds:5.2f})  {bar}")
-    print("-" * 54)
-    print(f"  Predicted outcome : {labels[best_idx]} ({probs[best_idx]*100:.1f}%)")
-    print("=" * 54 + "\n")
 
 
 def league_table(d, season, competition_id):
@@ -1131,7 +1020,7 @@ def predict_year(d, feats, final, rs, cols, comp_default, cfg, year=2026):
     return pd.DataFrame(rows).sort_values(["date", "competition", "home"]).reset_index(drop=True)
 
 
-def run(df, out_dir="out", cfg_overrides=None, verbose=True, print_2026=False):
+def run(df, out_dir="out", cfg_overrides=None, verbose=True):
     cfg = {**CFG, **(cfg_overrides or {})}
     os.makedirs(out_dir, exist_ok=True)
     log = print if verbose else (lambda *a, **k: None)
@@ -1229,16 +1118,9 @@ def run(df, out_dir="out", cfg_overrides=None, verbose=True, print_2026=False):
         .apply(tuple, axis=1)
         .to_dict()
     )
-    dom = feats[feats["competition_id"].astype(str).str.endswith("1")].sort_values("date")
-    club_primary_comp = {}
-    for r in dom[["home", "away", "competition_id"]].itertuples():
-        club_primary_comp[r.home] = r.competition_id
-        club_primary_comp[r.away] = r.competition_id
-
     rs = RatingSystem(
         final, cols, snap_dates, snap_vals, feats[feats.has_lineups],
-        comp_default, club_names, hfa=cfg["hfa"],
-        comp_map=comp_map, club_primary_comp=club_primary_comp,
+        comp_default, club_names, hfa=cfg["hfa"], comp_map=comp_map,
     )
     test_end_date = te["date"].max() + pd.Timedelta(days=1)
     table = rs.ratings(as_of=test_end_date)
@@ -1263,15 +1145,33 @@ def run(df, out_dir="out", cfg_overrides=None, verbose=True, print_2026=False):
         played_2026 = preds_2026[preds_2026["status"] == "played"]
         acc_2026 = played_2026["correct"].mean() if len(played_2026) else float("nan")
         log(f"\nSaved {len(preds_2026)} predictions for 2026 to {out_dir}/predictions_2026.csv (played acc={acc_2026:.3f})")
-        if print_2026:
-            with pd.option_context("display.max_rows", None, "display.width", 200):
-                log(preds_2026.to_string(index=False))
 
-    # Refit on all good seasons (train+val+test) for live future matchup predictions
+    # Refit on all good seasons (train+val+test) and save standalone predictor.pkl
     all_ok = feats["split"].isin(["train", "val", "test"])
     prod_gbm = copy.copy(gbm)
     prod_gbm.refit(feats.loc[all_ok, cols].astype(float), feats.loc[all_ok, "y"].values)
-    rs.model = prod_gbm
+
+    dom = feats[feats["competition_id"].astype(str).str.endswith("1")].sort_values("date")
+    club_primary_comp = {}
+    for r in dom[["home", "away", "competition_id"]].itertuples():
+        club_primary_comp[r.home] = r.competition_id
+        club_primary_comp[r.away] = r.competition_id
+
+    predictor_bundle = dict(
+        model=prod_gbm.m,
+        cols=cols,
+        hfa=cfg["hfa"],
+        snap_dates=dict(snap_dates),
+        snap_vals=dict(snap_vals),
+        club_names=club_names,
+        comp_default=comp_default,
+        comp_map=comp_map,
+        club_primary_comp=club_primary_comp,
+        last_date=feats["date"].max(),
+    )
+    with open(f"{out_dir}/predictor.pkl", "wb") as fh:
+        pickle.dump(predictor_bundle, fh)
+    log(f"Saved standalone predictor to {out_dir}/predictor.pkl")
 
     try:
         feats.to_parquet(f"{out_dir}/features.parquet", index=False)
@@ -1328,17 +1228,10 @@ def make_synthetic(n_clubs=18, n_seasons=10, seed=0):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hybrid Club+Player Elo & GBM Match Predictor")
+    parser = argparse.ArgumentParser(description="Train Hybrid Club+Player Elo & GBM Match Predictor")
     parser.add_argument("--db", default="transfermarkt-datasets.duckdb", help="Path to DuckDB file")
     parser.add_argument("--out", default="out", help="Output directory")
     parser.add_argument("--synthetic", action="store_true", help="Run on synthetic test data instead of DuckDB")
-    parser.add_argument("--print-2026", action="store_true", help="Print all 2026 predictions to console")
-    parser.add_argument("--home", default=None, help="Home team name to predict")
-    parser.add_argument("--away", default=None, help="Away team name to predict")
-    parser.add_argument("--comp", default=None, help="Optional competition ID (e.g. GB1, L1, CL)")
-    parser.add_argument("--date", default=None, help="Optional prediction date YYYY-MM-DD")
-    parser.add_argument("--rest-home", type=float, default=None, help="Optional rest days for home team")
-    parser.add_argument("--rest-away", type=float, default=None, help="Optional rest days for away team")
     args = parser.parse_args()
 
     if args.synthetic:
@@ -1378,33 +1271,5 @@ if __name__ == "__main__":
         df = con.sql(query).df()
         con.close()
 
-    res = run(df, out_dir=args.out, print_2026=args.print_2026)
-    rs = res["rs"]
-
-    if args.home and args.away:
-        pred = rs.predict_match(
-            args.home, args.away,
-            competition_id=args.comp,
-            as_of=args.date,
-            rest_home=args.rest_home,
-            rest_away=args.rest_away,
-            interactive=False,
-        )
-        print_match_prediction(pred)
-    else:
-        print("\n=== Interactive Match Predictor (press Enter on Home team to quit) ===")
-        while True:
-            try:
-                h_q = input("Home team: ").strip()
-                if not h_q or h_q.lower() in ("q", "quit", "exit"):
-                    break
-                a_q = input("Away team: ").strip()
-                if not a_q or a_q.lower() in ("q", "quit", "exit"):
-                    break
-                comp_q = input("Competition ID (optional, Enter for auto): ").strip() or None
-                pred = rs.predict_match(h_q, a_q, competition_id=comp_q, interactive=True)
-                print_match_prediction(pred)
-            except (EOFError, KeyboardInterrupt):
-                break
-            except Exception as e:
-                print(f"Error: {e}\n")
+    res = run(df, out_dir=args.out)
+    print(res["ranking"].head(20))
